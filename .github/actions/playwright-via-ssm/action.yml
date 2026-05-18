@@ -4,10 +4,8 @@ description: |
   EC2 instance, via an SSM port-forwarding session. Tunnel is opened, used,
   and torn down automatically. On failure, configurable artefacts (screenshot,
   video, trace) are uploaded to S3 and as GitHub Actions artefacts.
-author: 'Tim'
 
 inputs:
-  # ---------------------------------------------------------------- Test selection
   app_name:
     description: 'Application name. Maps to a pytest marker (e.g. "widgets" -> -m widgets).'
     required: true
@@ -19,12 +17,6 @@ inputs:
     description: 'Working directory containing pytest.ini and tests.'
     required: false
     default: 'tests/playwright'
-
-  # ---------------------------------------------------------------- Tenant / target
-  tenant_slug:
-    description: 'Tenant identifier. Used for artefact paths and logging.'
-    required: false
-    default: 'test'
   instance_id:
     description: 'EC2 instance ID to tunnel through (the SSM "jump host").'
     required: true
@@ -43,8 +35,6 @@ inputs:
     description: 'Host header the app expects (for host-based routing). Defaults to remote_host.'
     required: false
     default: ''
-
-  # ---------------------------------------------------------------- Environment
   python_version:
     description: 'Python version to install.'
     required: false
@@ -53,8 +43,6 @@ inputs:
     description: 'AWS region for SSM and S3.'
     required: false
     default: 'eu-west-2'
-
-  # ---------------------------------------------------------------- Failure capture
   capture_on_failure:
     description: |
       Comma-separated list of artefact types to capture on failure.
@@ -74,8 +62,6 @@ inputs:
     description: 'Retention for GitHub Actions artefacts (S3 lifecycle handled bucket-side).'
     required: false
     default: '7'
-
-  # ---------------------------------------------------------------- Tunnel behaviour
   tunnel_wait_seconds:
     description: 'Max seconds to wait for the SSM tunnel to come up before failing.'
     required: false
@@ -84,6 +70,10 @@ inputs:
     description: 'Skip the curl-based tunnel health check. "true" or "false".'
     required: false
     default: 'false'
+  install_ssm_plugin:
+    description: 'Whether to install the AWS Session Manager plugin. "true" or "false".'
+    required: false
+    default: 'true'
 
 outputs:
   test_outcome:
@@ -99,9 +89,6 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    # ============================================================
-    # 1. Resolve capture configuration
-    # ============================================================
     - name: Resolve capture configuration
       id: capture
       shell: bash
@@ -143,9 +130,6 @@ runs:
           echo "host_header=${{ inputs.app_host_header }}" >> "$GITHUB_OUTPUT"
         fi
 
-    # ============================================================
-    # 2. Python + Playwright with proper caching
-    # ============================================================
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -185,17 +169,13 @@ runs:
       run: playwright install --with-deps chromium
 
     - name: Install Playwright OS deps (cache hit)
-      # Browser binaries cache; OS-level apt deps do not. Without this,
-      # cached browsers fail with "error while loading shared libraries".
       if: steps.pw_cache.outputs.cache-hit == 'true'
       shell: bash
       working-directory: ${{ inputs.tests_dir }}
       run: playwright install-deps chromium
 
-    # ============================================================
-    # 3. SSM Session Manager plugin + tunnel
-    # ============================================================
     - name: Install AWS Session Manager plugin
+      if: inputs.install_ssm_plugin == 'true'
       shell: bash
       run: |
         if command -v session-manager-plugin >/dev/null 2>&1; then
@@ -262,9 +242,6 @@ runs:
           exit 1
         fi
 
-    # ============================================================
-    # 4. Run the tests
-    # ============================================================
     - name: Run Playwright tests
       id: run_tests
       shell: bash
@@ -272,7 +249,6 @@ runs:
       env:
         BASE_URL: https://localhost:${{ inputs.local_port }}
         APP_HOST_HEADER: ${{ steps.resolve.outputs.host_header }}
-        TENANT_SLUG: ${{ inputs.tenant_slug }}
         APP_NAME: ${{ inputs.app_name }}
       run: |
         set +e
@@ -309,9 +285,6 @@ runs:
         # Don't exit non-zero here — let cleanup + upload run, fail at the end.
         exit 0
 
-    # ============================================================
-    # 5. Cleanup — always runs
-    # ============================================================
     - name: Close SSM tunnel
       if: always()
       shell: bash
@@ -322,9 +295,6 @@ runs:
           sleep 2
         fi
 
-    # ============================================================
-    # 6. Artefact upload
-    # ============================================================
     - name: Upload artefacts to S3
       id: upload_s3
       if: |
@@ -342,7 +312,7 @@ runs:
           echo "trace_viewer_urls=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        PREFIX="playwright/${{ github.run_id }}/${{ inputs.tenant_slug }}/${{ inputs.app_name }}"
+        PREFIX="playwright/${{ github.run_id }}/${{ inputs.app_name }}"
         BUCKET="${{ inputs.artefact_bucket }}"
         echo "Uploading test-results/ to s3://$BUCKET/$PREFIX/"
         aws s3 sync test-results/ "s3://$BUCKET/$PREFIX/" \
@@ -377,20 +347,17 @@ runs:
         && inputs.capture_on_failure != 'none'
       uses: actions/upload-artifact@v4
       with:
-        name: playwright-${{ inputs.tenant_slug }}-${{ inputs.app_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        name: playwright-${{ inputs.app_name }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ inputs.tests_dir }}/test-results/
         retention-days: ${{ inputs.artefact_retention_days }}
         if-no-files-found: ignore
 
-    # ============================================================
-    # 7. Summary + final fail
-    # ============================================================
     - name: Write job summary
       if: always() && steps.run_tests.outputs.outcome != ''
       shell: bash
       run: |
         {
-          echo "## Playwright tests: \`${{ inputs.tenant_slug }}\` / \`${{ inputs.app_name }}\`"
+          echo "## Playwright tests:  \`${{ inputs.app_name }}\`"
           echo
           echo "- **Outcome:** ${{ steps.run_tests.outputs.outcome }}"
           echo "- **Marker:** \`${{ inputs.app_name }} and (${{ inputs.test_tags }})\`"
@@ -413,5 +380,5 @@ runs:
       if: steps.run_tests.outputs.outcome == 'failure'
       shell: bash
       run: |
-        echo "::error::Playwright tests failed for ${{ inputs.tenant_slug }}/${{ inputs.app_name }}"
+        echo "::error::Playwright tests failed for ${{ inputs.app_name }}"
         exit 1
