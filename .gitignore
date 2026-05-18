@@ -1,0 +1,13 @@
+# Playwright test outputs
+tests/playwright/test-results/
+tests/playwright/playwright-report/
+tests/playwright/.pytest_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
