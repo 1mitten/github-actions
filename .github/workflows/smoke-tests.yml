@@ -1,0 +1,100 @@
+name: Smoke tests
+
+# Reusable workflow that calling deploy pipelines can invoke after a
+# tenant deploy completes (e.g. before flipping the ALB target group).
+#
+# Example invocation from a deploy workflow:
+#
+#   smoke:
+#     needs: deploy
+#     uses: ./.github/workflows/smoke-tests.yml
+#     with:
+#       tenant_slug: acme
+#       instance_id: i-0abc123def456
+#       remote_host: acme.internal.example.com
+#       app_host_header: acme.example.com
+#       apps: '["widgets","orders"]'
+#     secrets:
+#       AWS_OIDC_ROLE_ARN: ${{ secrets.SPOKE_DEPLOY_ROLE_ARN }}
+
+on:
+  workflow_call:
+    inputs:
+      tenant_slug:
+        type: string
+        required: false
+        default: 'test'
+      instance_id:
+        type: string
+        required: true
+      remote_host:
+        type: string
+        required: true
+      app_host_header:
+        type: string
+        required: false
+        default: ''
+      apps:
+        description: 'JSON array of app names, e.g. ["widgets","orders"]'
+        type: string
+        required: true
+      test_tags:
+        type: string
+        required: false
+        default: 'smoke'
+      capture_on_failure:
+        type: string
+        required: false
+        default: 'screenshot,trace,junit'
+      artefact_bucket:
+        type: string
+        required: false
+        default: 'test-xxx-ci-playwright-artifacts'
+      aws_region:
+        type: string
+        required: false
+        default: 'eu-west-2'
+    secrets:
+      AWS_OIDC_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: echo "matrix={\"app\":${{ inputs.apps }}}" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Run Playwright tests via SSM
+        uses: ./.github/actions/playwright-via-ssm
+        with:
+          app_name: ${{ matrix.app }}
+          test_tags: ${{ inputs.test_tags }}
+          tenant_slug: ${{ inputs.tenant_slug }}
+          instance_id: ${{ inputs.instance_id }}
+          remote_host: ${{ inputs.remote_host }}
+          app_host_header: ${{ inputs.app_host_header }}
+          capture_on_failure: ${{ inputs.capture_on_failure }}
+          artefact_bucket: ${{ inputs.artefact_bucket }}
+          aws_region: ${{ inputs.aws_region }}

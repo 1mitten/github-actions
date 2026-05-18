@@ -1,0 +1,78 @@
+name: Smoke tests (manual)
+
+# Manual / on-demand smoke run against a single tenant.
+# Useful for testing the action itself, debugging a specific tenant,
+# or running outside the normal deploy pipeline.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_slug:
+        description: 'Tenant slug (used for artefact paths and logging)'
+        type: string
+        required: false
+        default: 'test'
+      instance_id:
+        description: 'EC2 instance ID to tunnel through'
+        type: string
+        required: true
+      remote_host:
+        description: 'Remote hostname (internal ALB DNS or instance private DNS)'
+        type: string
+        required: true
+      app_host_header:
+        description: 'Host header the app expects (leave blank to default to remote_host)'
+        type: string
+        required: false
+        default: ''
+      app_name:
+        description: 'Application to test (pytest marker)'
+        type: choice
+        options:
+          - widgets
+          - orders
+          - reporting
+        default: widgets
+      test_tags:
+        description: 'Pytest marker expression to AND with app_name'
+        type: string
+        required: false
+        default: 'smoke'
+      capture_on_failure:
+        description: 'Artefacts to capture on failure'
+        type: choice
+        options:
+          - 'screenshot,trace,junit'
+          - 'screenshot,video,trace,junit'
+          - 'all'
+          - 'trace'
+          - 'screenshot'
+          - 'none'
+        default: 'screenshot,trace,junit'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: eu-west-2
+
+      - name: Run Playwright tests via SSM
+        uses: ./.github/actions/playwright-via-ssm
+        with:
+          app_name: ${{ inputs.app_name }}
+          test_tags: ${{ inputs.test_tags }}
+          tenant_slug: ${{ inputs.tenant_slug }}
+          instance_id: ${{ inputs.instance_id }}
+          remote_host: ${{ inputs.remote_host }}
+          app_host_header: ${{ inputs.app_host_header }}
+          capture_on_failure: ${{ inputs.capture_on_failure }}

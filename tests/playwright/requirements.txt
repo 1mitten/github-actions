@@ -1,0 +1,5 @@
+playwright==1.49.0
+pytest==8.3.4
+pytest-playwright==0.6.2
+# Uncomment if you opt into capture_on_failure=html
+# pytest-html==4.1.1

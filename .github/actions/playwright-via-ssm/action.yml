@@ -1,0 +1,417 @@
+name: 'Playwright tests via SSM tunnel'
+description: |
+  Runs tagged Python Playwright tests against a remote host reachable from an
+  EC2 instance, via an SSM port-forwarding session. Tunnel is opened, used,
+  and torn down automatically. On failure, configurable artefacts (screenshot,
+  video, trace) are uploaded to S3 and as GitHub Actions artefacts.
+author: 'Tim'
+
+inputs:
+  # ---------------------------------------------------------------- Test selection
+  app_name:
+    description: 'Application name. Maps to a pytest marker (e.g. "widgets" -> -m widgets).'
+    required: true
+  test_tags:
+    description: 'Additional pytest marker expression, ANDed with app_name. e.g. "smoke", "smoke and not slow".'
+    required: false
+    default: 'smoke'
+  tests_dir:
+    description: 'Working directory containing pytest.ini and tests.'
+    required: false
+    default: 'tests/playwright'
+
+  # ---------------------------------------------------------------- Tenant / target
+  tenant_slug:
+    description: 'Tenant identifier. Used for artefact paths and logging.'
+    required: false
+    default: 'test'
+  instance_id:
+    description: 'EC2 instance ID to tunnel through (the SSM "jump host").'
+    required: true
+  remote_host:
+    description: 'Hostname on the remote side of the tunnel (e.g. internal ALB DNS, instance private DNS).'
+    required: true
+  remote_port:
+    description: 'Port on the remote host to forward to.'
+    required: false
+    default: '443'
+  local_port:
+    description: 'Local port to bind the tunnel on the runner.'
+    required: false
+    default: '8443'
+  app_host_header:
+    description: 'Host header the app expects (for host-based routing). Defaults to remote_host.'
+    required: false
+    default: ''
+
+  # ---------------------------------------------------------------- Environment
+  python_version:
+    description: 'Python version to install.'
+    required: false
+    default: '3.12'
+  aws_region:
+    description: 'AWS region for SSM and S3.'
+    required: false
+    default: 'eu-west-2'
+
+  # ---------------------------------------------------------------- Failure capture
+  capture_on_failure:
+    description: |
+      Comma-separated list of artefact types to capture on failure.
+      Valid values: screenshot, video, trace, junit, html.
+      Use "none" to disable all capture. Use "all" for everything.
+    required: false
+    default: 'screenshot,trace,junit'
+  artefact_bucket:
+    description: 'S3 bucket for artefact uploads on failure. Set to empty string to skip S3 upload.'
+    required: false
+    default: 'test-xxx-ci-playwright-artifacts'
+  upload_to_github:
+    description: 'Whether to upload artefacts as GitHub Actions artefacts. "true" or "false".'
+    required: false
+    default: 'true'
+  artefact_retention_days:
+    description: 'Retention for GitHub Actions artefacts (S3 lifecycle handled bucket-side).'
+    required: false
+    default: '7'
+
+  # ---------------------------------------------------------------- Tunnel behaviour
+  tunnel_wait_seconds:
+    description: 'Max seconds to wait for the SSM tunnel to come up before failing.'
+    required: false
+    default: '30'
+  skip_tunnel_healthcheck:
+    description: 'Skip the curl-based tunnel health check. "true" or "false".'
+    required: false
+    default: 'false'
+
+outputs:
+  test_outcome:
+    description: 'success | failure'
+    value: ${{ steps.run_tests.outputs.outcome }}
+  s3_prefix:
+    description: 'S3 prefix where artefacts were uploaded, empty if not uploaded.'
+    value: ${{ steps.upload_s3.outputs.prefix }}
+  trace_viewer_urls:
+    description: 'Newline-separated trace.playwright.dev viewer URLs (presigned).'
+    value: ${{ steps.upload_s3.outputs.trace_viewer_urls }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================================
+    # 1. Resolve capture configuration
+    # ============================================================
+    - name: Resolve capture configuration
+      id: capture
+      shell: bash
+      run: |
+        set -euo pipefail
+        raw="${{ inputs.capture_on_failure }}"
+        normalised=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        if [ "$normalised" = "all" ]; then
+          normalised="screenshot,video,trace,junit,html"
+        fi
+        if [ "$normalised" = "none" ] || [ -z "$normalised" ]; then
+          normalised=""
+        fi
+        IFS=',' read -ra tokens <<< "$normalised"
+        valid="screenshot video trace junit html"
+        for t in "${tokens[@]:-}"; do
+          [ -z "$t" ] && continue
+          if ! echo " $valid " | grep -q " $t "; then
+            echo "::error::Invalid capture_on_failure value: '$t'. Valid: $valid (or 'all'/'none')."
+            exit 1
+          fi
+        done
+        for type in screenshot video trace junit html; do
+          if echo ",$normalised," | grep -q ",$type,"; then
+            echo "${type}=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${type}=false" >> "$GITHUB_OUTPUT"
+          fi
+        done
+        echo "Capture configuration: ${normalised:-(none)}"
+
+    - name: Resolve effective Host header
+      id: resolve
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.app_host_header }}" ]; then
+          echo "host_header=${{ inputs.remote_host }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "host_header=${{ inputs.app_host_header }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ============================================================
+    # 2. Python + Playwright with proper caching
+    # ============================================================
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+        cache: 'pip'
+        cache-dependency-path: ${{ inputs.tests_dir }}/requirements.txt
+
+    - name: Install Python dependencies
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Resolve Playwright version
+      id: pw_version
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      run: |
+        # Cache key by playwright version, not requirements.txt hash —
+        # invalidates only when playwright itself changes.
+        VERSION=$(playwright --version | awk '{print $2}')
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Playwright version: $VERSION"
+
+    - name: Cache Playwright browsers
+      id: pw_cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}-${{ steps.pw_version.outputs.version }}
+
+    - name: Install Playwright browsers (cache miss)
+      if: steps.pw_cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      run: playwright install --with-deps chromium
+
+    - name: Install Playwright OS deps (cache hit)
+      # Browser binaries cache; OS-level apt deps do not. Without this,
+      # cached browsers fail with "error while loading shared libraries".
+      if: steps.pw_cache.outputs.cache-hit == 'true'
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      run: playwright install-deps chromium
+
+    # ============================================================
+    # 3. SSM Session Manager plugin + tunnel
+    # ============================================================
+    - name: Install AWS Session Manager plugin
+      shell: bash
+      run: |
+        if command -v session-manager-plugin >/dev/null 2>&1; then
+          echo "session-manager-plugin already installed: $(session-manager-plugin --version)"
+          exit 0
+        fi
+        curl -sSL \
+          "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+          -o /tmp/session-manager-plugin.deb
+        sudo dpkg -i /tmp/session-manager-plugin.deb
+        session-manager-plugin --version
+
+    - name: Open SSM port-forwarding tunnel
+      id: tunnel
+      shell: bash
+      run: |
+        set -euo pipefail
+        TARGET="${{ inputs.instance_id }}"
+        REMOTE_HOST="${{ inputs.remote_host }}"
+        REMOTE_PORT="${{ inputs.remote_port }}"
+        LOCAL_PORT="${{ inputs.local_port }}"
+        echo "Tunnel: localhost:$LOCAL_PORT -> $REMOTE_HOST:$REMOTE_PORT via $TARGET"
+        # Use ToRemoteHost — lets us tunnel to the ALB/app hostname through
+        # the instance, not just to a port on the instance itself.
+        aws ssm start-session \
+          --target "$TARGET" \
+          --document-name AWS-StartPortForwardingSessionToRemoteHost \
+          --parameters "host=$REMOTE_HOST,portNumber=$REMOTE_PORT,localPortNumber=$LOCAL_PORT" \
+          --region "${{ inputs.aws_region }}" \
+          > /tmp/ssm-tunnel.log 2>&1 &
+        TUNNEL_PID=$!
+        echo "tunnel_pid=$TUNNEL_PID" >> "$GITHUB_OUTPUT"
+        for i in $(seq 1 ${{ inputs.tunnel_wait_seconds }}); do
+          if nc -z localhost "$LOCAL_PORT" 2>/dev/null; then
+            echo "Tunnel ready after ${i}s"
+            exit 0
+          fi
+          if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            echo "::error::SSM tunnel process exited before becoming ready"
+            cat /tmp/ssm-tunnel.log
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "::error::Tunnel did not come up within ${{ inputs.tunnel_wait_seconds }}s"
+        cat /tmp/ssm-tunnel.log
+        exit 1
+
+    - name: Verify tunnel connectivity
+      if: inputs.skip_tunnel_healthcheck != 'true'
+      shell: bash
+      run: |
+        # curl before Playwright — far easier to diagnose curl than a Playwright timeout.
+        HTTP_CODE=$(curl -sS -o /tmp/curl-body -w "%{http_code}" \
+          --max-time 15 \
+          -k \
+          -H "Host: ${{ steps.resolve.outputs.host_header }}" \
+          "https://localhost:${{ inputs.local_port }}/" || echo "000")
+        echo "Tunnel health check: HTTP $HTTP_CODE"
+        head -c 500 /tmp/curl-body 2>/dev/null || true
+        echo
+        if [ "$HTTP_CODE" = "000" ]; then
+          echo "::error::Tunnel established but app unreachable. Check security groups, Host header, and target listener."
+          exit 1
+        fi
+
+    # ============================================================
+    # 4. Run the tests
+    # ============================================================
+    - name: Run Playwright tests
+      id: run_tests
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      env:
+        BASE_URL: https://localhost:${{ inputs.local_port }}
+        APP_HOST_HEADER: ${{ steps.resolve.outputs.host_header }}
+        TENANT_SLUG: ${{ inputs.tenant_slug }}
+        APP_NAME: ${{ inputs.app_name }}
+      run: |
+        set +e
+        ARGS=(-v --output=test-results)
+        if [ "${{ steps.capture.outputs.screenshot }}" = "true" ]; then
+          ARGS+=(--screenshot=only-on-failure)
+        fi
+        if [ "${{ steps.capture.outputs.video }}" = "true" ]; then
+          ARGS+=(--video=retain-on-failure)
+        fi
+        if [ "${{ steps.capture.outputs.trace }}" = "true" ]; then
+          ARGS+=(--tracing=retain-on-failure)
+        fi
+        if [ "${{ steps.capture.outputs.junit }}" = "true" ]; then
+          ARGS+=(--junit-xml=test-results/junit.xml)
+        fi
+        if [ "${{ steps.capture.outputs.html }}" = "true" ]; then
+          ARGS+=(--html=test-results/report.html --self-contained-html)
+        fi
+        MARKER="${{ inputs.app_name }}"
+        TAGS="${{ inputs.test_tags }}"
+        if [ -n "$TAGS" ]; then
+          MARKER="$MARKER and ($TAGS)"
+        fi
+        ARGS+=(-m "$MARKER")
+        echo "Running: pytest ${ARGS[*]}"
+        pytest "${ARGS[@]}"
+        EXIT=$?
+        if [ $EXIT -eq 0 ]; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+        else
+          echo "outcome=failure" >> "$GITHUB_OUTPUT"
+        fi
+        # Don't exit non-zero here — let cleanup + upload run, fail at the end.
+        exit 0
+
+    # ============================================================
+    # 5. Cleanup — always runs
+    # ============================================================
+    - name: Close SSM tunnel
+      if: always()
+      shell: bash
+      run: |
+        PID="${{ steps.tunnel.outputs.tunnel_pid }}"
+        if [ -n "$PID" ]; then
+          kill "$PID" 2>/dev/null || true
+          sleep 2
+        fi
+
+    # ============================================================
+    # 6. Artefact upload
+    # ============================================================
+    - name: Upload artefacts to S3
+      id: upload_s3
+      if: |
+        always()
+        && steps.run_tests.outputs.outcome == 'failure'
+        && inputs.artefact_bucket != ''
+        && inputs.capture_on_failure != 'none'
+      shell: bash
+      working-directory: ${{ inputs.tests_dir }}
+      run: |
+        set -euo pipefail
+        if [ ! -d test-results ] || [ -z "$(ls -A test-results 2>/dev/null)" ]; then
+          echo "No test-results to upload."
+          echo "prefix=" >> "$GITHUB_OUTPUT"
+          echo "trace_viewer_urls=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        PREFIX="playwright/${{ github.run_id }}/${{ inputs.tenant_slug }}/${{ inputs.app_name }}"
+        BUCKET="${{ inputs.artefact_bucket }}"
+        echo "Uploading test-results/ to s3://$BUCKET/$PREFIX/"
+        aws s3 sync test-results/ "s3://$BUCKET/$PREFIX/" \
+          --region "${{ inputs.aws_region }}" \
+          --no-progress
+        echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+        VIEWER_URLS=""
+        while IFS= read -r trace_path; do
+          [ -z "$trace_path" ] && continue
+          KEY="$PREFIX/$(realpath --relative-to=test-results "$trace_path")"
+          SIGNED=$(aws s3 presign "s3://$BUCKET/$KEY" \
+            --region "${{ inputs.aws_region }}" \
+            --expires-in 604800)
+          ENCODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$SIGNED")
+          VIEWER_URLS="${VIEWER_URLS}https://trace.playwright.dev/?trace=${ENCODED}"$'\n'
+        done < <(find test-results -name 'trace.zip')
+        {
+          echo "trace_viewer_urls<<EOF"
+          printf "%s" "$VIEWER_URLS"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+        if [ -n "$VIEWER_URLS" ]; then
+          echo "Trace viewer URLs:"
+          printf "%s" "$VIEWER_URLS"
+        fi
+
+    - name: Upload artefacts to GitHub Actions
+      if: |
+        always()
+        && steps.run_tests.outputs.outcome == 'failure'
+        && inputs.upload_to_github == 'true'
+        && inputs.capture_on_failure != 'none'
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-${{ inputs.tenant_slug }}-${{ inputs.app_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ inputs.tests_dir }}/test-results/
+        retention-days: ${{ inputs.artefact_retention_days }}
+        if-no-files-found: ignore
+
+    # ============================================================
+    # 7. Summary + final fail
+    # ============================================================
+    - name: Write job summary
+      if: always() && steps.run_tests.outputs.outcome != ''
+      shell: bash
+      run: |
+        {
+          echo "## Playwright tests: \`${{ inputs.tenant_slug }}\` / \`${{ inputs.app_name }}\`"
+          echo
+          echo "- **Outcome:** ${{ steps.run_tests.outputs.outcome }}"
+          echo "- **Marker:** \`${{ inputs.app_name }} and (${{ inputs.test_tags }})\`"
+          echo "- **Target:** \`${{ inputs.remote_host }}:${{ inputs.remote_port }}\` via \`${{ inputs.instance_id }}\`"
+          if [ -n "${{ steps.upload_s3.outputs.prefix }}" ]; then
+            echo "- **S3 artefacts:** \`s3://${{ inputs.artefact_bucket }}/${{ steps.upload_s3.outputs.prefix }}/\`"
+          fi
+          if [ -n "${{ steps.upload_s3.outputs.trace_viewer_urls }}" ]; then
+            echo
+            echo "### Trace viewer links"
+            echo
+            while IFS= read -r url; do
+              [ -z "$url" ] && continue
+              echo "- [Open trace ↗]($url)"
+            done <<< "${{ steps.upload_s3.outputs.trace_viewer_urls }}"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Fail step on test failure
+      if: steps.run_tests.outputs.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::error::Playwright tests failed for ${{ inputs.tenant_slug }}/${{ inputs.app_name }}"
+        exit 1
